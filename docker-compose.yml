@@ -1,0 +1,157 @@
+services:
+  # 1. Источник: PostgreSQL с логической репликацией (нужна для Debezium)
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres_source
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: inventory
+    command: ["postgres", "-c", "wal_level=logical"]
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d inventory"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # 2. Kafka в режиме KRaft (без Zookeeper), официальный образ apache/kafka
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: kafka_broker
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      # внутри docker-сети ходим на kafka:29092, с хоста на localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # 3. Kafka Connect с плагином Debezium
+  debezium-connect:
+    image: quay.io/debezium/connect:2.6
+    container_name: debezium_connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: "1"
+      CONFIG_STORAGE_TOPIC: my_connect_configs
+      OFFSET_STORAGE_TOPIC: my_connect_offsets
+      STATUS_STORAGE_TOPIC: my_connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+    ports:
+      - "8083:8083"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8083/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  # 4. Lakehouse-хранилище: MinIO (S3)
+  minio:
+    image: minio/minio
+    container_name: minio_lakehouse
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  # 5. Одноразовый контейнер: создаёт бакет warehouse и выходит
+  minio-init:
+    image: minio/mc
+    container_name: minio_init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 admin password; do sleep 2; done;
+      mc mb --ignore-existing local/warehouse;
+      exit 0;
+      "
+
+  # 6. Каталог Iceberg (REST). Spark и Trino берут отсюда список таблиц и метаданные
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    container_name: iceberg_rest
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    ports:
+      - "8181:8181"
+
+  # 7. Spark Structured Streaming: Kafka -> SCD Type 2 -> Iceberg
+  # Если топика еще нет (коннектор не зарегистрирован), job падает и перезапускается сам
+  spark:
+    image: tabulario/spark-iceberg:3.5.1_1.5.0
+    container_name: spark_scd2
+    depends_on:
+      kafka:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_started
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+    volumes:
+      - ./spark_scd2.py:/opt/job/spark_scd2.py
+      - spark_checkpoint:/checkpoint
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >
+        spark-submit --master local[2]
+        --conf spark.jars.ivy=/tmp/.ivy
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1
+        /opt/job/spark_scd2.py
+    restart: on-failure
+
+  # 8. Trino: SQL-запросы к таблицам Iceberg
+  trino:
+    image: trinodb/trino:475
+    container_name: trino_query
+    depends_on:
+      - iceberg-rest
+    volumes:
+      - ./trino/lake.properties:/etc/trino/catalog/lake.properties
+    ports:
+      - "8080:8080"
+
+volumes:
+  minio_data:
+  spark_checkpoint:
